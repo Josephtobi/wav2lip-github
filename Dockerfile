@@ -5,9 +5,9 @@ ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1
 
-# System deps (Python 3.10, ffmpeg, OpenCV libs)
+# System deps (Python 3.10, ffmpeg, OpenCV libs, curl)
 RUN apt-get update && apt-get install -y \
-    python3.10 python3-pip git ffmpeg libsm6 libxext6 \
+    python3.10 python3-pip git ffmpeg libsm6 libxext6 curl \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
