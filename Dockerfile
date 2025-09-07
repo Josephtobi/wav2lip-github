@@ -16,9 +16,8 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Pull Wav2Lip source (frozen commit for reproducibility)
-RUN git clone https://github.com/Rudrabha/Wav2Lip.git && \
-    cd Wav2Lip && git checkout 9c551c6
+# Pull Wav2Lip source (use latest stable version)
+RUN git clone https://github.com/Rudrabha/Wav2Lip.git
 
 # App code
 COPY app.py inference_util.py download_models.sh entrypoint.sh ./
