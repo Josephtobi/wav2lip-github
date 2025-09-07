@@ -1,0 +1,531 @@
+README.md
+Wav2Lip API – Dockerized FastAPI Service (Python 3.10, CUDA 12.1, GHCR)
+Overview
+
+This service lip-syncs a fixed base video to a user-uploaded audio file using Wav2Lip (PyTorch).
+
+Input: audio (.wav, .mp3, .aac, .ogg, etc.)
+
+Static base video: baked into the image or mounted at runtime
+
+Output: .mp4 (video muxed with audio)
+
+Optimized for RunPod GPU pods (Dedicated HTTP). Clean pins for Python 3.10 + CUDA 12.1 to avoid compatibility issues.
+
+Folder Structure
+wav2lip-api/
+├── Dockerfile
+├── requirements.txt
+├── app.py                 # FastAPI server
+├── inference_util.py      # Model + inference logic (full, below)
+├── download_models.sh     # Downloads Wav2Lip checkpoints
+├── entrypoint.sh          # Starts Uvicorn
+├── assets/
+│   └── base.mp4           # Base video (or mount at runtime)
+└── .github/
+    └── workflows/
+        └── docker-publish.yml
+
+Requirements (Python 3.10 + CUDA 12.1)
+
+These pins are tested to avoid the usual NumPy / librosa / Torch mismatches.
+
+requirements.txt
+
+# API
+fastapi==0.111.0
+uvicorn[standard]==0.30.1
+pydantic==2.8.2
+python-multipart==0.0.9
+
+# Core numeric stack
+numpy==1.26.4
+scipy==1.11.4
+pillow>=9.2,<11
+
+# Audio/vision
+librosa==0.10.2.post1
+soundfile==0.12.1
+opencv-python==4.10.0.84
+ffmpeg-python==0.2.0
+
+# PyTorch + CUDA 12.1
+--extra-index-url https://download.pytorch.org/whl/cu121
+torch==2.3.1+cu121
+torchvision==0.18.1+cu121
+
+Dockerfile
+FROM nvidia/cuda:12.1.1-cudnn8-runtime-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
+
+# System deps (Python 3.10, ffmpeg, OpenCV libs)
+RUN apt-get update && apt-get install -y \
+    python3.10 python3-pip git ffmpeg libsm6 libxext6 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Python deps
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Pull Wav2Lip source (frozen commit for reproducibility)
+RUN git clone https://github.com/Rudrabha/Wav2Lip.git && \
+    cd Wav2Lip && git checkout 9c551c6
+
+# App code
+COPY app.py inference_util.py download_models.sh entrypoint.sh ./
+RUN chmod +x download_models.sh entrypoint.sh && ./download_models.sh
+
+# Data dirs
+RUN mkdir -p assets outputs
+
+EXPOSE 8000
+ENTRYPOINT ["./entrypoint.sh"]
+
+Model Downloader
+
+download_models.sh
+
+#!/usr/bin/env bash
+set -euo pipefail
+
+mkdir -p /app/Wav2Lip/checkpoints
+cd /app/Wav2Lip/checkpoints
+
+# Stable baseline checkpoint (recommended)
+if [ ! -f wav2lip.pth ]; then
+  echo "Downloading wav2lip.pth ..."
+  curl -L -o wav2lip.pth \
+    "https://huggingface.co/rippertnt/wav2lip/resolve/main/checkpoints/wav2lip.pth?download=true"
+fi
+
+# Optional GAN checkpoint (crisper but can flicker)
+if [ ! -f wav2lip_gan.pth ]; then
+  echo "Downloading wav2lip_gan.pth ..."
+  curl -L -o wav2lip_gan.pth \
+    "https://github.com/Rudrabha/Wav2Lip/releases/download/v1.0/wav2lip_gan.pth"
+fi
+
+FastAPI App
+
+app.py
+
+from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi.responses import FileResponse, PlainTextResponse
+from pathlib import Path
+import tempfile, os
+
+from inference_util import Wav2LipEngine
+
+BASE_VIDEO = os.getenv("BASE_VIDEO", "/app/assets/base.mp4")
+CHECKPOINT = os.getenv("W2L_CKPT", "/app/Wav2Lip/checkpoints/wav2lip.pth")
+BATCH_SIZE = int(os.getenv("BATCH_SIZE", "8"))
+
+app = FastAPI(title="Wav2Lip API", version="1.0.0")
+engine = None
+
+@app.on_event("startup")
+def load_engine():
+    global engine
+    if not Path(BASE_VIDEO).exists():
+        raise RuntimeError(f"Missing base video at {BASE_VIDEO}")
+    if not Path(CHECKPOINT).exists():
+        raise RuntimeError(f"Missing checkpoint at {CHECKPOINT}")
+    engine = Wav2LipEngine(
+        base_video=BASE_VIDEO,
+        checkpoint=CHECKPOINT,
+        batch_size=BATCH_SIZE
+    )
+
+@app.get("/health", response_class=PlainTextResponse)
+def health():
+    return "ok"
+
+@app.post("/lip-sync")
+async def lip_sync(audio: UploadFile = File(...)):
+    allowed = {"audio/wav", "audio/x-wav", "audio/mpeg", "audio/aac", "audio/ogg", "audio/mp4", "application/octet-stream"}
+    if (audio.content_type or "application/octet-stream") not in allowed:
+        raise HTTPException(400, detail=f"Unsupported audio type: {audio.content_type}")
+    with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(audio.filename or '')[-1]) as f:
+        f.write(await audio.read())
+        audio_path = f.name
+
+    out_path = tempfile.mktemp(suffix=".mp4")
+    try:
+        engine.synthesize(audio_path, out_path)
+    except Exception as e:
+        raise HTTPException(500, detail=str(e))
+
+    out_name = f"lipsynced_{Path(audio.filename or 'audio').stem}.mp4"
+    return FileResponse(out_path, media_type="video/mp4", filename=out_name)
+
+Entrypoint
+
+entrypoint.sh
+
+#!/usr/bin/env bash
+set -e
+exec uvicorn app:app --host 0.0.0.0 --port 8000 --workers ${UVICORN_WORKERS:-1}
+
+FULL Inference Engine
+
+inference_util.py
+
+Notes:
+
+Uses OpenCV Haar cascade (bundled with OpenCV) for face detection to avoid external heavy dependencies.
+
+If a face isn’t detected, it falls back to a safe center crop so your base video still processes.
+
+Wav2Lip requires cropped face regions rescaled to 96×96 during inference; this wrapper handles that, then pastes results back.
+
+Audio is auto-resampled to 16 kHz mono before mel computation.
+
+import os
+import sys
+import subprocess
+import tempfile
+from pathlib import Path
+from typing import Optional, Tuple, List
+
+import numpy as np
+import torch
+import cv2
+import librosa
+
+# Add Wav2Lip repo to path
+W2L_ROOT = str(Path(__file__).parent / 'Wav2Lip')
+if W2L_ROOT not in sys.path:
+    sys.path.insert(0, W2L_ROOT)
+
+# Import model
+from Wav2Lip.models import Wav2Lip  # type: ignore
+
+DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+
+class Wav2LipEngine:
+    """
+    Minimal, production-minded Wav2Lip wrapper.
+
+    - Detects (or approximates) a face box on the base video
+    - Computes mels from audio
+    - Runs batched inference on GPU
+    - Re-composites frames and muxes audio with FFmpeg
+    """
+
+    def __init__(
+        self,
+        base_video: str,
+        checkpoint: str,
+        batch_size: int = 8,
+        fps_override: Optional[int] = None,
+        face_detect_scale: float = 1.1,
+        face_detect_min_neighbors: int = 5,
+        face_box_fallback_ratio: float = 0.45,
+    ):
+        self.base_video = base_video
+        self.checkpoint = checkpoint
+        self.batch_size = batch_size
+        self.fps_override = fps_override
+        self.face_detect_scale = face_detect_scale
+        self.face_detect_min_neighbors = face_detect_min_neighbors
+        self.face_box_fallback_ratio = face_box_fallback_ratio
+
+        self.model = self._load_model(checkpoint)
+        self.model.eval()
+
+        # Load Haar cascade for face detect (bundled with OpenCV)
+        self.haar = cv2.CascadeClassifier(
+            str(Path(cv2.data.haarcascades) / "haarcascade_frontalface_default.xml")
+        )
+
+        torch.backends.cudnn.benchmark = True
+
+    # ---------- Utils ----------
+
+    @staticmethod
+    def _ffmpeg(cmd: List[str]):
+        subprocess.check_call(['ffmpeg', '-y', *cmd],
+                              stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
+
+    @staticmethod
+    def _to_wav_16k_mono(src_path: str, dst_path: str):
+        subprocess.check_call([
+            'ffmpeg', '-y', '-i', src_path, '-ac', '1', '-ar', '16000', dst_path
+        ], stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT)
+
+    def _load_model(self, checkpoint_path: str) -> torch.nn.Module:
+        model = Wav2Lip()
+        ckpt = torch.load(checkpoint_path, map_location='cpu')
+        state = ckpt.get('state_dict', ckpt)
+        model.load_state_dict(state)
+        return model.to(DEVICE)
+
+    # ---------- Media IO ----------
+
+    def _extract_audio_wav(self, audio_in: str) -> str:
+        out_wav = tempfile.mktemp(suffix='.wav')
+        self._to_wav_16k_mono(audio_in, out_wav)
+        return out_wav
+
+    def _read_all_frames(self, video_path: str) -> Tuple[List[np.ndarray], int]:
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            raise RuntimeError(f"Cannot open video: {video_path}")
+        fps = int(self.fps_override or cap.get(cv2.CAP_PROP_FPS) or 25)
+        frames = []
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            frames.append(frame)
+        cap.release()
+        if not frames:
+            raise RuntimeError("No frames extracted from base video.")
+        return frames, fps
+
+    # ---------- Audio features ----------
+
+    @staticmethod
+    def _mels(wav_path: str, fps: int) -> List[np.ndarray]:
+        wav, sr = librosa.load(wav_path, sr=16000)
+        hop_length = int(16000 / fps)
+        mel = librosa.feature.melspectrogram(
+            y=wav, sr=16000, n_fft=1024, hop_length=hop_length,
+            n_mels=80, fmin=55, fmax=7600
+        )
+        mel = np.log(np.maximum(1e-5, mel))
+        mel_chunks = []
+        mel_step = 16
+        idx = 0
+        while True:
+            start = idx * mel_step
+            if start + mel_step > mel.shape[1]:
+                break
+            mel_chunks.append(mel[:, start:start+mel_step])
+            idx += 1
+        if len(mel_chunks) == 0:
+            raise RuntimeError("Audio too short after preprocessing.")
+        return mel_chunks
+
+    # ---------- Face detection / crop box ----------
+
+    def _largest_face_box(self, frames: List[np.ndarray]) -> Optional[Tuple[int, int, int, int]]:
+        """
+        Try to find the largest face across a sampled subset of frames.
+        Returns (x1, y1, x2, y2) or None.
+        """
+        H_sample = max(1, len(frames)//20)
+        best = None
+        best_area = 0
+        for f in frames[::H_sample]:
+            gray = cv2.cvtColor(f, cv2.COLOR_BGR2GRAY)
+            faces = self.haar.detectMultiScale(
+                gray,
+                scaleFactor=self.face_detect_scale,
+                minNeighbors=self.face_detect_min_neighbors,
+                flags=cv2.CASCADE_SCALE_IMAGE
+            )
+            for (x, y, w, h) in faces:
+                area = w * h
+                if area > best_area:
+                    best_area = area
+                    best = (x, y, x + w, y + h)
+        return best
+
+    def _fallback_center_box(self, frame_shape: Tuple[int, int, int]) -> Tuple[int, int, int, int]:
+        """
+        If detection fails, use a center crop box (ratio of width/height).
+        """
+        h, w = frame_shape[:2]
+        r = self.face_box_fallback_ratio
+        bw, bh = int(w * r), int(h * r)
+        x1 = (w - bw)//2
+        y1 = (h - bh)//2
+        return x1, y1, x1 + bw, y1 + bh
+
+    # ---------- Main pipeline ----------
+
+    def synthesize(self, audio_file: str, out_path: str) -> str:
+        # 1) Audio → wav 16k mono
+        wav16 = self._extract_audio_wav(audio_file)
+
+        # 2) Video → frames (+ fps)
+        frames, fps = self._read_all_frames(self.base_video)
+
+        # 3) Face box
+        box = self._largest_face_box(frames)
+        if box is None:
+            box = self._fallback_center_box(frames[0].shape)
+        x1, y1, x2, y2 = box
+
+        # 4) Audio → mels aligned to fps
+        mels = self._mels(wav16, fps)
+
+        # 5) Batched inference
+        gen_frames: List[np.ndarray] = []
+        model = self.model
+
+        for i in range(0, len(mels), self.batch_size):
+            mel_batch = mels[i:i + self.batch_size]
+            img_batch = []
+            for j, _mel in enumerate(mel_batch):
+                idx = min(i + j, len(frames) - 1)
+                f = frames[idx].copy()
+                face = f[y1:y2, x1:x2]
+                # Resize to 96x96 as expected by Wav2Lip
+                face = cv2.resize(face, (96, 96))
+                img = face.astype(np.float32) / 255.0
+                img_batch.append(img)
+
+            # Create tensors
+            img_batch_np = np.stack(img_batch)  # (B, 96, 96, 3)
+            img_batch_np = np.transpose(img_batch_np, (0, 3, 1, 2))  # (B, 3, 96, 96)
+            img_t = torch.from_numpy(img_batch_np).float().to(DEVICE)
+
+            mel_batch_np = np.float32(mel_batch)
+            mel_batch_np = np.expand_dims(mel_batch_np, 1)  # (B, 1, 80, 16)
+            mel_t = torch.from_numpy(mel_batch_np).float().to(DEVICE)
+
+            with torch.no_grad():
+                pred = model(mel_t, img_t)  # (B, 3, 96, 96)
+
+            pred = pred.cpu().numpy().transpose(0, 2, 3, 1) * 255.0
+            for k in range(pred.shape[0]):
+                new_face = pred[k].astype(np.uint8)
+                # Paste back to original frame size at the detected box
+                f = frames[min(i + k, len(frames) - 1)].copy()
+                new_face_resized = cv2.resize(new_face, (x2 - x1, y2 - y1))
+                f[y1:y2, x1:x2] = new_face_resized
+                gen_frames.append(f)
+
+        # 6) Write temporary silent video
+        tmp_vid = tempfile.mktemp(suffix='.mp4')
+        h, w, _ = gen_frames[0].shape
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        writer = cv2.VideoWriter(tmp_vid, fourcc, fps, (w, h))
+        for f in gen_frames:
+            writer.write(f)
+        writer.release()
+
+        # 7) Mux audio with video (shortest)
+        self._ffmpeg([
+            '-i', tmp_vid, '-i', wav16,
+            '-c:v', 'libx264', '-preset', 'fast', '-crf', '18',
+            '-c:a', 'aac', '-shortest', out_path
+        ])
+
+        return out_path
+
+GitHub Actions (build & push to GHCR)
+
+.github/workflows/docker-publish.yml
+
+name: Build & Push – GHCR (CUDA / Wav2Lip)
+
+on:
+  push:
+    branches: [ main ]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set lowercase image name
+        run: echo "IMAGE_NAME_LC=${IMAGE_NAME,,}" >> $GITHUB_ENV
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME_LC }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=tag
+            type=sha
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - name: Build & Push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+Local Build & Test
+docker build -t wav2lip-api .
+docker run --rm --gpus all -p 8000:8000 \
+  -v $(pwd)/assets:/app/assets \
+  -e BASE_VIDEO=/app/assets/base.mp4 \
+  wav2lip-api
+
+
+Test endpoint:
+
+curl -X POST "http://localhost:8000/lip-sync" \
+  -F "audio=@sample.wav" \
+  -o output.mp4
+
+RunPod (Dedicated GPU Pod, HTTP)
+
+Image: ghcr.io/<owner>/<repo>:latest
+
+Port: 8000
+
+Healthcheck: /health
+
+Env:
+
+BASE_VIDEO=/app/assets/base.mp4 (if mounting)
+
+W2L_CKPT=/app/Wav2Lip/checkpoints/wav2lip.pth (default)
+
+Volume: mount /app/assets and upload your base.mp4 if you didn’t bake it.
+
+Troubleshooting
+Symptom	Likely Cause	Fix
+torch.cuda.is_available() == False	CUDA wheel / base mismatch	Use this Dockerfile (CUDA 12.1 base + cu121 wheels)
+ImportError: cv2	OpenCV missing	Keep opencv-python==4.10.0.84 installed
+ffmpeg not found	Missing system ffmpeg	Dockerfile installs ffmpeg
+Output is slow	Large base video	Use 720p template; tune BATCH_SIZE
+RunPod can’t pull image	GHCR private	Make GHCR package public, or add a registry secret in RunPod
+Versioning
+git tag v1.0.0
+git push origin v1.0.0
+
+
+Your image will be available as ghcr.io/<owner>/<repo>:v1.0.0.

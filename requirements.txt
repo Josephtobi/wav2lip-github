@@ -1,0 +1,21 @@
+# API
+fastapi==0.111.0
+uvicorn[standard]==0.30.1
+pydantic==2.8.2
+python-multipart==0.0.9
+
+# Core numeric stack
+numpy==1.26.4
+scipy==1.11.4
+pillow>=9.2,<11
+
+# Audio/vision
+librosa==0.10.2.post1
+soundfile==0.12.1
+opencv-python==4.10.0.84
+ffmpeg-python==0.2.0
+
+# PyTorch + CUDA 12.1
+--extra-index-url https://download.pytorch.org/whl/cu121
+torch==2.3.1+cu121
+torchvision==0.18.1+cu121
